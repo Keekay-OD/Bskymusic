@@ -1,0 +1,15 @@
+services:
+  bsky-music:
+    container_name: bsky-music
+    build: ./app
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app
+    command: python -u app.py
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,3 +1,4 @@
 requests
 atproto
 python-dotenv
+Pillow

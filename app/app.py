@@ -4,9 +4,11 @@ import sqlite3
 import requests
 import traceback
 from datetime import datetime
-from atproto import Client
+from atproto import Client, models
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from PIL import Image
+from io import BytesIO
 
 # =============================
 # CONFIG
@@ -21,6 +23,9 @@ BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE")
 BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 
 DB_PATH = "state.db"
+
+MAX_IMAGE_SIZE = 950 * 1024  # 950KB (under Bluesky's 976.56KB limit)
+MAX_IMAGE_DIMENSION = 2000  # Max width/height to resize to
 
 # =============================
 # HTTP SESSION (PRODUCTION SAFE)
@@ -179,6 +184,72 @@ def get_album_art(mbid):
 
 
 # =============================
+# IMAGE PROCESSING
+# =============================
+
+def resize_image(image_bytes):
+    """
+    Resize image to fit within Bluesky's size and dimension limits
+    """
+    try:
+        # Open the image
+        img = Image.open(BytesIO(image_bytes))
+        
+        # Convert to RGB if necessary (remove alpha channel)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Create a white background
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        
+        # Check if resizing is needed based on dimensions
+        width, height = img.size
+        
+        # If image is larger than MAX_IMAGE_DIMENSION in either dimension, resize it
+        if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+            # Calculate new dimensions while maintaining aspect ratio
+            ratio = min(MAX_IMAGE_DIMENSION / width, MAX_IMAGE_DIMENSION / height)
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            
+            # Resize image
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            print(f"📏 Resized image from {width}x{height} to {new_width}x{new_height}")
+        
+        # Save to bytes with quality adjustment if needed
+        quality = 95
+        output = BytesIO()
+        
+        # Try saving with decreasing quality until size is under limit
+        while True:
+            output.seek(0)
+            output.truncate()
+            
+            # Save as JPEG (more compression than PNG)
+            img.save(output, format='JPEG', quality=quality, optimize=True)
+            
+            size = output.tell()
+            
+            if size < MAX_IMAGE_SIZE or quality <= 10:
+                break
+                
+            # Reduce quality and try again
+            quality -= 10
+            print(f"📦 Image size: {size/1024:.2f}KB, reducing quality to {quality}...")
+        
+        final_size = output.tell()
+        print(f"✅ Final image size: {final_size/1024:.2f}KB")
+        
+        return output.getvalue()
+        
+    except Exception as e:
+        print(f"⚠️ Image processing failed: {e}")
+        return None
+
+
+# =============================
 # GENRES
 # =============================
 
@@ -214,28 +285,93 @@ def generate_progress_bar():
 
 
 # =============================
+# HASHTAG FACETS
+# =============================
+
+def create_hashtag_facets(text, hashtags):
+    """
+    Create Bluesky facets for hashtags.
+    Returns a tuple of (text_with_hashtags, facets)
+    """
+    facets = []
+    
+    # Add the hashtags to the text
+    hashtag_text = " ".join(hashtags)
+    full_text = f"{text}\n\n{hashtag_text}"
+    
+    # Calculate the starting position of hashtags in the full text
+    hashtag_start = len(text) + 2  # +2 for the two newlines
+    
+    current_pos = hashtag_start
+    
+    for hashtag in hashtags:
+        # Find where this hashtag appears in the text
+        hashtag_without_hash = hashtag[1:]  # Remove the # for the tag value
+        
+        # Create the facet for this hashtag
+        facet = models.AppBskyRichtextFacet.Main(
+            features=[
+                models.AppBskyRichtextFacet.Tag(
+                    tag=hashtag_without_hash
+                )
+            ],
+            index=models.AppBskyRichtextFacet.ByteSlice(
+                byte_start=current_pos,
+                byte_end=current_pos + len(hashtag)
+            )
+        )
+        
+        facets.append(facet)
+        
+        # Move position past this hashtag plus the space
+        current_pos += len(hashtag) + 1  # +1 for the space
+    
+    return full_text, facets
+
+
+# =============================
 # POST TO BLUESKY
 # =============================
 
-def post_to_bluesky(text, image_bytes=None):
+def post_to_bluesky(text, image_bytes=None, hashtags=None):
     print("📤 Posting to Bluesky...")
 
     try:
-        if image_bytes:
-            upload = client.upload_blob(image_bytes)
-
-            client.send_post(
-                text=text,
-                embed={
-                    "$type": "app.bsky.embed.images",
-                    "images": [{
-                        "image": upload.blob,
-                        "alt": text
-                    }]
-                }
-            )
+        if hashtags:
+            full_text, facets = create_hashtag_facets(text, hashtags)
         else:
-            client.send_post(text)
+            full_text = text
+            facets = None
+
+        if image_bytes:
+            # Resize the image before uploading
+            resized_image = resize_image(image_bytes)
+            
+            if not resized_image:
+                print("⚠️ Image processing failed, posting without image")
+                client.send_post(
+                    text=full_text,
+                    facets=facets
+                )
+            else:
+                upload = client.upload_blob(resized_image)
+
+                client.send_post(
+                    text=full_text,
+                    facets=facets,
+                    embed={
+                        "$type": "app.bsky.embed.images",
+                        "images": [{
+                            "image": upload.blob,
+                            "alt": text.split('\n')[0]  # Use first line as alt text
+                        }]
+                    }
+                )
+        else:
+            client.send_post(
+                text=full_text,
+                facets=facets
+            )
 
         print("✅ Post successful.")
         return True
@@ -266,24 +402,30 @@ def check_now_playing():
         return
 
     genres = get_genres(artist)
-    genre_tags = " ".join(f"#{g.replace(' ', '')}" for g in genres)
+    
+    # Create hashtags list
+    hashtags = ["#NowPlaying"]
+    
+    # Add artist hashtag (remove spaces)
+    artist_tag = f"#{artist.replace(' ', '')}"
+    hashtags.append(artist_tag)
+    
+    # Add genre hashtags
+    for genre in genres:
+        genre_tag = f"#{genre.replace(' ', '')}"
+        hashtags.append(genre_tag)
 
     progress_bar = generate_progress_bar()
-
-    clean_artist = artist.replace(" ", "")
 
     post_text = f"""🎧 KeeCloud Music
 
 🎵 {artist} – {title}
 
-{progress_bar}
-
-#NowPlaying #{clean_artist} {genre_tags}
-"""
+{progress_bar}"""
 
     image = get_album_art(release_mbid)
 
-    success = post_to_bluesky(post_text, image)
+    success = post_to_bluesky(post_text, image, hashtags)
 
     if success:
         save_post(artist, title)

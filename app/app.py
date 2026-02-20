@@ -2,222 +2,314 @@ import os
 import time
 import sqlite3
 import requests
+import traceback
 from datetime import datetime
 from atproto import Client
-from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-load_dotenv()
+# =============================
+# CONFIG
+# =============================
+
+CHECK_INTERVAL = 240  # 4 minutes
 
 LB_USERNAME = os.getenv("LB_USERNAME")
 LB_TOKEN = os.getenv("LB_TOKEN")
+
 BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE")
 BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 
-CHECK_INTERVAL = 240  # 4 minutes
-LB_HEADERS = {"Authorization": f"Token {LB_TOKEN}"}
+DB_PATH = "state.db"
 
-print("========== 🎵 BSKY MUSIC BOT STARTING ==========")
-print("User:", LB_USERNAME)
-print("Interval:", CHECK_INTERVAL, "seconds")
+# =============================
+# HTTP SESSION (PRODUCTION SAFE)
+# =============================
 
-# --------------------------
+def create_session():
+    session = requests.Session()
+
+    retries = Retry(
+        total=5,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+
+    adapter = HTTPAdapter(max_retries=retries)
+
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    return session
+
+
+session = create_session()
+
+# =============================
+# BLUESKY CLIENT
+# =============================
+
+client = Client()
+
+
+def safe_login():
+    try:
+        client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
+        print("✅ Bluesky login successful.")
+    except Exception as e:
+        print(f"⚠️ Bluesky login failed: {e}")
+        time.sleep(5)
+        client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
+
+
+# =============================
 # DATABASE
-# --------------------------
+# =============================
 
-conn = sqlite3.connect("state.db", check_same_thread=False)
-c = conn.cursor()
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
 
-c.execute("""
-CREATE TABLE IF NOT EXISTS posts (
-    id INTEGER PRIMARY KEY,
-    artist TEXT,
-    title TEXT,
-    date TEXT
-)
-""")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artist TEXT,
+            title TEXT,
+            post_date TEXT
+        )
+    """)
 
-conn.commit()
+    conn.commit()
+    conn.close()
 
-print("Database initialized.")
 
 def already_posted_today(artist, title):
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    c.execute(
-        "SELECT 1 FROM posts WHERE artist=? AND title=? AND date=?",
-        (artist, title, today)
-    )
-    return c.fetchone() is not None
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    today = datetime.utcnow().date().isoformat()
+
+    c.execute("""
+        SELECT * FROM posts
+        WHERE artist=? AND title=? AND post_date=?
+    """, (artist, title, today))
+
+    result = c.fetchone()
+    conn.close()
+
+    return result is not None
 
 
-def record_post(artist, title):
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    c.execute(
-        "INSERT INTO posts (artist, title, date) VALUES (?, ?, ?)",
-        (artist, title, today)
-    )
+def save_post(artist, title):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    today = datetime.utcnow().date().isoformat()
+
+    c.execute("""
+        INSERT INTO posts (artist, title, post_date)
+        VALUES (?, ?, ?)
+    """, (artist, title, today))
+
     conn.commit()
-    print("Recorded post in DB.")
+    conn.close()
 
 
-# --------------------------
-# PROGRESS BAR
-# --------------------------
-
-def build_progress_bar(percent=75):
-    total_blocks = 10
-    filled = int((percent / 100) * total_blocks)
-    empty = total_blocks - filled
-    return "▰" * filled + "▱" * empty
-
-
-# --------------------------
+# =============================
 # LISTENBRAINZ
-# --------------------------
+# =============================
 
 def get_now_playing():
-    print("Checking ListenBrainz...")
-
     url = f"https://api.listenbrainz.org/1/user/{LB_USERNAME}/playing-now"
-    r = requests.get(url, headers=LB_HEADERS)
 
-    print("Status:", r.status_code)
+    headers = {"Authorization": f"Token {LB_TOKEN}"}
 
-    if r.status_code != 200:
-        print("Error:", r.text)
+    response = session.get(url, headers=headers, timeout=15)
+
+    if response.status_code != 200:
+        print("⚠️ ListenBrainz API error:", response.status_code)
         return None
 
-    listens = r.json().get("payload", {}).get("listens", [])
+    data = response.json()
+
+    if "payload" not in data or "listens" not in data["payload"]:
+        return None
+
+    listens = data["payload"]["listens"]
+
     if not listens:
-        print("Nothing playing.")
         return None
 
     track = listens[0]["track_metadata"]
 
     artist = track.get("artist_name")
     title = track.get("track_name")
-    year = track.get("release_year", "")
-    mbid = track.get("additional_info", {}).get("release_mbid")
+    release = track.get("release_name")
 
-    # Try to get genre tags
-    tags = track.get("tags", [])
-    genres = []
+    additional = track.get("additional_info", {})
+    release_mbid = additional.get("release_mbid")
 
-    if tags:
-        for tag in tags[:3]:  # max 3 genre tags
-            clean = tag.replace(" ", "")
-            genres.append(f"#{clean}")
+    return {
+        "artist": artist,
+        "title": title,
+        "release": release,
+        "release_mbid": release_mbid,
+    }
 
-    print("Now Playing:", artist, "-", title)
 
-    return artist, title, year, mbid, genres
-
+# =============================
+# ALBUM ART
+# =============================
 
 def get_album_art(mbid):
     if not mbid:
-        print("No MBID for album art.")
         return None
 
-    url = f"https://coverartarchive.org/release/{mbid}/front-500"
-    r = requests.get(url)
+    url = f"https://coverartarchive.org/release/{mbid}/front"
 
-    if r.status_code == 200:
-        print("Album art found.")
-        return r.content
+    try:
+        response = session.get(url, timeout=15)
+        if response.status_code == 200:
+            return response.content
+    except Exception as e:
+        print("Album art fetch failed:", e)
 
-    print("No album art available.")
     return None
 
 
-# --------------------------
-# BLUESKY
-# --------------------------
+# =============================
+# GENRES
+# =============================
 
-print("Logging into Bluesky...")
-client = Client()
-client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
-print("Bluesky login successful.")
+def get_genres(artist):
+    try:
+        url = f"https://musicbrainz.org/ws/2/artist/?query=artist:{artist}&fmt=json"
+        response = session.get(url, timeout=15)
+
+        if response.status_code != 200:
+            return []
+
+        data = response.json()
+        if not data.get("artists"):
+            return []
+
+        tags = data["artists"][0].get("tags", [])
+        return [tag["name"] for tag in tags[:3]]
+
+    except Exception as e:
+        print("Genre lookup failed:", e)
+        return []
+
+
+# =============================
+# PROGRESS BAR
+# =============================
+
+def generate_progress_bar():
+    # Fake animated-style static bar (visual only)
+    filled = 7
+    empty = 3
+    return "▰" * filled + "▱" * empty
+
+
+# =============================
+# POST TO BLUESKY
+# =============================
 
 def post_to_bluesky(text, image_bytes=None):
-    print("Posting to Bluesky...")
+    print("📤 Posting to Bluesky...")
 
-    if image_bytes:
-        upload = client.upload_blob(image_bytes)
+    try:
+        if image_bytes:
+            upload = client.upload_blob(image_bytes)
 
-        client.send_post(
-            text=text,
-            embed={
-                "$type": "app.bsky.embed.images",
-                "images": [{
-                    "image": upload.blob,
-                    "alt": text
-                }]
-            }
-        )
-    else:
-        client.send_post(text)
+            client.send_post(
+                text=text,
+                embed={
+                    "$type": "app.bsky.embed.images",
+                    "images": [{
+                        "image": upload.blob,
+                        "alt": text
+                    }]
+                }
+            )
+        else:
+            client.send_post(text)
 
-    print("Post successful.")
+        print("✅ Post successful.")
+        return True
+
+    except Exception as e:
+        print("⚠️ Post failed:", e)
+        safe_login()
+        return False
 
 
-# --------------------------
-# MAIN CHECK
-# --------------------------
+# =============================
+# MAIN LOGIC
+# =============================
 
-def run_check():
-    now = get_now_playing()
+def check_now_playing():
+    track = get_now_playing()
 
-    if not now:
+    if not track:
+        print("Nothing playing.")
         return
 
-    artist, title, year, mbid, genres = now
+    artist = track["artist"]
+    title = track["title"]
+    release_mbid = track["release_mbid"]
 
     if already_posted_today(artist, title):
         print("Already posted today.")
         return
 
-    # Clean title line
-    if year and str(year).strip():
-        title_line = f"{artist} – {title} ({year})"
-    else:
-        title_line = f"{artist} – {title}"
+    genres = get_genres(artist)
+    genre_tags = " ".join(f"#{g.replace(' ', '')}" for g in genres)
 
-    # Animated-style progress (fake but looks dynamic)
-    progress_bar = build_progress_bar(75)
+    progress_bar = generate_progress_bar()
 
     clean_artist = artist.replace(" ", "")
-    base_tags = f"#NowPlaying #{clean_artist}"
 
-    genre_tags = " ".join(genres)
+    post_text = f"""🎧 KeeCloud Music
 
-    post_text = f"""🎧 VibesCloud Music
-
-🎵 {title_line}
+🎵 {artist} – {title}
 
 {progress_bar}
 
-{base_tags} {genre_tags}
+#NowPlaying #{clean_artist} {genre_tags}
 """
 
-    album_art = get_album_art(mbid)
+    image = get_album_art(release_mbid)
 
-    post_to_bluesky(post_text, album_art)
-    record_post(artist, title)
+    success = post_to_bluesky(post_text, image)
+
+    if success:
+        save_post(artist, title)
 
 
-# --------------------------
-# LOOP
-# --------------------------
+# =============================
+# STARTUP
+# =============================
 
-print("Initial check on startup...")
-run_check()
+if __name__ == "__main__":
+    print("🚀 Starting BskyMusic Bot...")
 
-while True:
-    print("Sleeping for", CHECK_INTERVAL, "seconds...")
-    time.sleep(CHECK_INTERVAL)
+    init_db()
+    safe_login()
 
-    print("Running scheduled check...")
+    print("🔎 Initial check on startup...")
     try:
-        run_check()
-    except Exception as e:
-        print("ERROR:", e)
-        time.sleep(30)
+        check_now_playing()
+    except Exception:
+        traceback.print_exc()
+
+    while True:
+        try:
+            print("⏱ Checking now playing...")
+            check_now_playing()
+        except Exception:
+            traceback.print_exc()
+
+        time.sleep(CHECK_INTERVAL)
